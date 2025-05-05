@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bmatcuk/doublestar/v4" // Added import
 	"github.com/goccy/go-json"
 	"github.com/hashicorp/go-multierror"
 	"github.com/k1LoW/octocov/config"
@@ -300,46 +301,96 @@ func (r *Report) Load(path string) error {
 
 func (r *Report) MeasureCoverage(paths, exclude []string) error {
 	if len(paths) == 0 {
-		return fmt.Errorf("coverage report not found: %s", paths)
+		return fmt.Errorf("coverage report not found: %v", paths) // Use %v for slice
 	}
 
+	originalPaths := make([]string, len(paths)) // Store original paths
+	copy(originalPaths, paths)
+	r.covPaths = originalPaths // Store original paths in the report
+
+	var expandedPaths []string
 	var cerr *multierror.Error
+
+	// Expand wildcards using doublestar
 	for _, path := range paths {
-		cov, rp, err := challengeParseReport(path)
+		matches, err := doublestar.Glob(os.DirFS("."), path) // Replaced filepath.Glob
 		if err != nil {
-			cerr = multierror.Append(cerr, err)
+			// Append glob errors (handles errors from doublestar.Glob)
+			cerr = multierror.Append(cerr, fmt.Errorf("error expanding glob pattern %q: %w", path, err))
+			continue
+		}
+		if len(matches) == 0 {
+			// Handle no matches - potentially log or error, for now just continue
+			// Consider adding a specific error if a pattern MUST match at least one file
+			log.Printf("Warning: glob pattern %q did not match any files", path)
+		}
+		expandedPaths = append(expandedPaths, matches...)
+	}
+
+	// De-duplicate the list of found paths
+	expandedPaths = lo.Uniq(expandedPaths)
+
+	if len(expandedPaths) == 0 && cerr == nil {
+		// If no files were found after globbing (and de-duplication) and no glob errors occurred, return an error
+		// This can happen if all patterns matched nothing, or if duplicates were the only results.
+		return fmt.Errorf("no coverage reports found matching patterns: %v", paths)
+	}
+
+	// Process expanded paths
+	var parsedPaths []string // Keep track of successfully parsed paths for merging
+	for _, expandedPath := range expandedPaths {
+		cov, rp, err := challengeParseReport(expandedPath)
+		if err != nil {
+			cerr = multierror.Append(cerr, fmt.Errorf("error parsing report %q: %w", expandedPath, err))
 			continue
 		}
 		if r.Coverage == nil {
 			r.Coverage = cov
 		} else {
 			if err := r.Coverage.Merge(cov); err != nil {
-				cerr = multierror.Append(cerr, err)
-				return cerr
+				cerr = multierror.Append(cerr, fmt.Errorf("error merging report %q: %w", expandedPath, err))
+				// Decide if merging error is fatal or should just be collected
+				// return cerr // Option: return immediately on merge error
+				continue // Option: collect merge errors and continue
 			}
 		}
-		r.covPaths = append(r.covPaths, rp)
+		parsedPaths = append(parsedPaths, rp) // Add the *reported* path from parsing
 	}
 
-	// fallback load report.json
-	if r.Coverage == nil && len(paths) == 1 {
-		path := paths[0]
-		if err := r.Load(path); err != nil {
-			cerr = multierror.Append(cerr, err)
-			return cerr
+	// Note: r.covPaths is already set to originalPaths earlier.
+	// If needed, we could store `parsedPaths` somewhere else if the distinction is important.
+
+	// fallback load report.json - This logic seems less relevant now with globbing.
+	// Consider if it should be removed or adapted. If paths contained only one *pattern*
+	// which expanded to one file, it might still apply? Or if the original paths contained
+	// exactly one non-pattern path that failed parsing above?
+	// For now, commenting it out as its behavior with wildcards is unclear.
+	/*
+		if r.Coverage == nil && len(paths) == 1 { // Should this check original paths or expanded?
+			path := paths[0] // Use original path or expanded path?
+			if err := r.Load(path); err != nil {
+				cerr = multierror.Append(cerr, err)
+				return cerr // Return combined errors
+			}
 		}
-	}
+	*/
 
+	// Check if any coverage was successfully loaded after processing all paths/errors
 	if r.Coverage == nil {
-		return cerr
+		if cerr != nil {
+			return fmt.Errorf("failed to load any coverage reports: %w", cerr)
+		}
+		// This case should ideally be caught earlier (len(expandedPaths) == 0)
+		return fmt.Errorf("no coverage reports found or loaded for paths: %v", paths)
 	}
 
+	// Apply exclusions
 	if err := r.Coverage.Exclude(exclude); err != nil {
-		cerr = multierror.Append(cerr, err)
-		return cerr
+		cerr = multierror.Append(cerr, fmt.Errorf("error applying exclusions: %w", err))
+		return cerr // Return combined errors including exclusion errors
 	}
 
-	return nil
+	return cerr.ErrorOrNil() // Return accumulated errors or nil if none occurred
 }
 
 func (r *Report) MeasureCodeToTestRatio(root string, code, test []string) error {

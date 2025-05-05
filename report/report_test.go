@@ -44,6 +44,205 @@ func TestNew(t *testing.T) {
 	}
 }
 
+// Helper function to copy files for testing
+func copyFile(src, dst string) error {
+	sourceFileStat, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+
+	if !sourceFileStat.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file", src)
+	}
+
+	source, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+
+	destination, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer destination.Close()
+	_, err = io.Copy(destination, source)
+	return err
+}
+
+func TestMeasureCoverage_Wildcards(t *testing.T) {
+	log.SetOutput(io.Discard) // Disable log in challengeParseReport()
+	// Prepare source file paths (adjust if coverage/testdata structure changes)
+	goCovSrc := filepath.Join(coverageTestdataDir(t), "gocover", "coverage.out")
+	lcovSrc := filepath.Join(coverageTestdataDir(t), "lcov", "lcov.info")
+
+	// Check if source files exist
+	if _, err := os.Stat(goCovSrc); os.IsNotExist(err) {
+		t.Fatalf("Source coverage file not found: %s", goCovSrc)
+	}
+	if _, err := os.Stat(lcovSrc); os.IsNotExist(err) {
+		t.Fatalf("Source coverage file not found: %s", lcovSrc)
+	}
+
+	// --- Test Setup ---
+	tmpDir := t.TempDir()
+	dir1 := filepath.Join(tmpDir, "dir1")
+	dir2 := filepath.Join(tmpDir, "dir2")
+	nestedDir := filepath.Join(dir2, "nested")
+
+	if err := os.MkdirAll(dir1, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(nestedDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Copy files into temp structure
+	goCovDst1 := filepath.Join(dir1, "coverage.out")
+	lcovDst := filepath.Join(nestedDir, "coverage.lcov")
+	goCovDst2 := filepath.Join(dir2, "another.out") // Same content, different name/location
+
+	if err := copyFile(goCovSrc, goCovDst1); err != nil {
+		t.Fatalf("Failed to copy %s to %s: %v", goCovSrc, goCovDst1, err)
+	}
+	if err := copyFile(lcovSrc, lcovDst); err != nil {
+		t.Fatalf("Failed to copy %s to %s: %v", lcovSrc, lcovDst, err)
+	}
+	if err := copyFile(goCovSrc, goCovDst2); err != nil {
+		t.Fatalf("Failed to copy %s to %s: %v", goCovSrc, goCovDst2, err)
+	}
+
+	// --- Test Cases ---
+	// Assumptions about file counts in test data:
+	const goCovFileCount = 1 // Assume gocover.out represents 1 source file
+	const lcovFileCount = 2  // Assume lcov.info represents 2 distinct source files
+	const mergedGoCovLcovCount = goCovFileCount + lcovFileCount
+
+	tests := []struct {
+		name            string
+		patterns        []string
+		exclude         []string
+		wantErr         bool
+		wantCovPathsLen int // Expected length of r.covPaths (should match input patterns)
+		wantFileCount   int // Expected number of *merged* files in r.Coverage.Files
+		wantIsCoverage  bool // Expect r.Coverage to be non-nil
+	}{
+		{
+			name:            "Single Star Match",
+			patterns:        []string{filepath.Join(tmpDir, "*", "coverage.out")},
+			wantErr:         false,
+			wantCovPathsLen: 1,
+			wantFileCount:   goCovFileCount, // Only dir1/coverage.out matches
+			wantIsCoverage:  true,
+		},
+		{
+			name:            "Double Star Match",
+			patterns:        []string{filepath.Join(tmpDir, "**", "*.lcov")}, // Should match nested dir
+			wantErr:         false,
+			wantCovPathsLen: 1,
+			wantFileCount:   lcovFileCount, // Only dir2/nested/coverage.lcov matches
+			wantIsCoverage:  true,
+		},
+		{
+			name:            "Double Star Match Go",
+			patterns:        []string{filepath.Join(tmpDir, "**", "coverage.out")}, // Should match dir1/coverage.out and dir2/another.out
+			wantErr:         false,
+			wantCovPathsLen: 1,
+			// Note: doublestar.Glob finds 2 files (dir1/coverage.out, dir2/another.out).
+			// However, they are identical gocover files, so merging results in 1 unique file coverage.
+			wantFileCount: goCovFileCount,
+			wantIsCoverage:  true,
+		},
+		{
+			name:            "Mixed Specific and Wildcard",
+			patterns:        []string{goCovDst1, filepath.Join(nestedDir, "*.lcov")}, // Specific file + wildcard
+			wantErr:         false,
+			wantCovPathsLen: 2,
+			wantFileCount:   mergedGoCovLcovCount, // gocover + lcov
+			wantIsCoverage:  true,
+		},
+		{
+			name:            "No Match",
+			patterns:        []string{filepath.Join(tmpDir, "*.nomatch")},
+			wantErr:         true, // Expect error because no files match
+			wantCovPathsLen: 1,
+			wantFileCount:   0,
+			wantIsCoverage:  false,
+		},
+		{
+			name:            "Multiple Wildcards",
+			patterns:        []string{filepath.Join(dir1, "*"), filepath.Join(nestedDir, "*")},
+			wantErr:         false,
+			wantCovPathsLen: 2,
+			wantFileCount:   mergedGoCovLcovCount, // gocover + lcov
+			wantIsCoverage:  true,
+		},
+		{
+			name:            "Directory Wildcard",
+			patterns:        []string{filepath.Join(tmpDir, "dir*", "*.out")}, // Matches dir1/coverage.out and dir2/another.out
+			wantErr:         false,
+			wantCovPathsLen: 1,
+			wantFileCount:   goCovFileCount, // Both are copies of the same gocover file, should merge to 1
+			wantIsCoverage:  true,
+		},
+		{
+			name:            "Exclude Pattern",
+			patterns:        []string{filepath.Join(tmpDir, "**", "*.out")}, // Matches dir1/coverage.out and dir2/another.out
+			exclude:         []string{"dir2/*"},                           // Exclude dir2/another.out
+			wantErr:         false,
+			wantCovPathsLen: 1,
+			wantFileCount:   goCovFileCount, // Only dir1/coverage.out should remain after exclusion
+			wantIsCoverage:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &Report{} // Create a new report for each test case
+			err := r.MeasureCoverage(tt.patterns, tt.exclude)
+
+			// Check error expectation
+			if (err != nil) != tt.wantErr {
+				t.Errorf("MeasureCoverage() error = %v, wantErr %v", err, tt.wantErr)
+				return // Don't proceed if error expectation is wrong
+			}
+
+			// Check if coverage was expected
+			if tt.wantIsCoverage && r.Coverage == nil {
+				t.Errorf("MeasureCoverage() r.Coverage is nil, want non-nil")
+			}
+			if !tt.wantIsCoverage && r.Coverage != nil {
+				t.Errorf("MeasureCoverage() r.Coverage is non-nil, want nil")
+			}
+
+			// Check number of merged files (only if coverage was expected)
+			if tt.wantIsCoverage && r.Coverage != nil {
+				gotFileCount := len(r.Coverage.Files)
+				if gotFileCount != tt.wantFileCount {
+					// Log file details for debugging
+					var fileNames []string
+					for _, f := range r.Coverage.Files {
+						fileNames = append(fileNames, f.Filename)
+					}
+					t.Logf("Files found: %v", fileNames)
+					t.Errorf("MeasureCoverage() len(r.Coverage.Files) = %d, want %d", gotFileCount, tt.wantFileCount)
+				}
+			}
+
+			// Check original paths stored in r.covPaths
+			if len(r.covPaths) != tt.wantCovPathsLen {
+				t.Errorf("MeasureCoverage() len(r.covPaths) = %d, want %d", len(r.covPaths), tt.wantCovPathsLen)
+			} else {
+				// Use cmpopts.SortSlices for stable comparison
+				opts := cmpopts.SortSlices(func(a, b string) bool { return a < b })
+				if diff := cmp.Diff(tt.patterns, r.covPaths, opts); diff != "" {
+					t.Errorf("MeasureCoverage() r.covPaths mismatch (-want +got):\n%s", diff)
+				}
+			}
+		})
+	}
+}
+
 func TestNewWithOptions(t *testing.T) {
 	tests := []struct {
 		opts []Option
