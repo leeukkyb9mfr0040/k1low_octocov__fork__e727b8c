@@ -313,9 +313,9 @@ func (r *Report) MeasureCoverage(paths, exclude []string) error {
 
 	// Expand wildcards using doublestar
 	for _, path := range paths {
-		matches, err := doublestar.Glob(os.DirFS("."), path) // Replaced filepath.Glob
+		matches, err := doublestar.FilepathGlob(path) // Use FilepathGlob instead of Glob with os.DirFS
 		if err != nil {
-			// Append glob errors (handles errors from doublestar.Glob)
+			// Append glob errors (handles errors from doublestar.FilepathGlob)
 			cerr = multierror.Append(cerr, fmt.Errorf("error expanding glob pattern %q: %w", path, err))
 			continue
 		}
