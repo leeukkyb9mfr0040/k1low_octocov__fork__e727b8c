@@ -222,7 +222,7 @@ func TestMeasureCoverage_Wildcards(t *testing.T) {
 					// Log file details for debugging
 					var fileNames []string
 					for _, f := range r.Coverage.Files {
-						fileNames = append(fileNames, f.Filename)
+						fileNames = append(fileNames, f.File)
 					}
 					t.Logf("Files found: %v", fileNames)
 					t.Errorf("MeasureCoverage() len(r.Coverage.Files) = %d, want %d", gotFileCount, tt.wantFileCount)
